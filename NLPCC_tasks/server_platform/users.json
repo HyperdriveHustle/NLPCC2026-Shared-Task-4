@@ -14,5 +14,9 @@
   "silly_agent": {
     "password": "$2b$12$iCApNzsQhiT8t3e6SWHfoulC/M4IHXckQwJvfIWszhFtNeFSlc2zu",
     "created_at": "2025-01-01"
+  },
+  "llm_agent": {
+    "password": "$2b$12$l7KxCJCRUk9qSvt29EhWvOfiz7UzqMDa.8d8kEBU4EXvJWLApo4ly",
+    "created_at": "2025-01-01"
   }
 }

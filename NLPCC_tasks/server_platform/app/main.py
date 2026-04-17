@@ -10,7 +10,7 @@ from logs import server_logger as logger
 from .api import agents, backtest, funds, live, reporting
 from .core.backtest import backtest_sessions, load_historical_sessions
 from .core.data_loader import init_data_loader
-from reporting.fund_arena import warm_up_report_cache
+from .reporting.fund_arena import warm_up_report_cache
 
 # --- FastAPI App Initialization ---
 app = FastAPI(

@@ -1,9 +1,12 @@
 import asyncio
+import atexit
+import hashlib
 import json
 import os
 import re
 import sys
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -25,51 +28,102 @@ from agent_platform.utils import CustomJsonOutputParser
 from .fund_info import FUND_INFO
 from .trading_strategy_prompt import BASELINE_TRADING_PROMPT, NONEWS_TRADING_PROMPT
 
-# 全局缓存变量
+# ─── Comprehensive Caching System ───
+# cache/
+# ├── news_summaries.json          # Keyed by date_title_source_ranking → summary
+# ├── sentiment_cache.json         # Keyed by date + hash(news_batch) → sentiment dict
+# ├── trading_cache.json           # Keyed by date + hash(inputs) → trading decision
+# └── daily/
+#     └── YYYY-MM-DD.json          # Per-day snapshot of all intermediate results
+
+CACHE_DIR = os.path.join(project_root, "cache")
+DAILY_CACHE_DIR = os.path.join(CACHE_DIR, "daily")
+NEWS_CACHE_FILE = os.path.join(CACHE_DIR, "news_summaries.json")
+SENTIMENT_CACHE_FILE = os.path.join(CACHE_DIR, "sentiment_cache.json")
+TRADING_CACHE_FILE = os.path.join(CACHE_DIR, "trading_cache.json")
+
+# In-memory caches
 GLOBAL_NEWS_CACHE = {}
-# 正在处理中的任务，用于防止重复请求 {cache_key: Future}
+SENTIMENT_CACHE = {}
+TRADING_CACHE = {}
 PROCESSING_TASKS = {}
-# project_root 已经是 agent_platform 目录，所以直接用 project_root 保存 cache
-CACHE_FILE_PATH = os.path.join(project_root, "news_summary_cache.json")
-CACHE_LOADED = False
-SAVE_COUNTER = 0
+
+# Track cache changes for periodic saving
+_news_cache_dirty = False
+_sentiment_cache_dirty = False
+_trading_cache_dirty = False
+NEWS_SAVE_INTERVAL = 1  # Save after every new summary (news is fixed data, avoid loss on crash)
+_news_save_counter = 0
 
 
-def load_global_cache():
-    global GLOBAL_NEWS_CACHE, CACHE_LOADED
-    if CACHE_LOADED:
-        return
+def _ensure_cache_dirs():
+    """Ensure cache directories exist."""
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    os.makedirs(DAILY_CACHE_DIR, exist_ok=True)
 
-    if os.path.exists(CACHE_FILE_PATH):
+
+def _load_json_cache(filepath: str) -> dict:
+    """Load a JSON cache file, return empty dict if not found."""
+    if os.path.exists(filepath):
         try:
-            with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
-                GLOBAL_NEWS_CACHE = json.load(f)
-            logger.info(f"Loaded {len(GLOBAL_NEWS_CACHE)} items from news cache.")
+            with open(filepath, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception as e:
-            logger.warning(f"Failed to load news cache: {e}")
-    CACHE_LOADED = True
+            logger.warning(f"Failed to load cache {filepath}: {e}")
+    return {}
 
 
-def _save_cache_sync():
+def _save_json_sync(data: dict, filepath: str, label: str = "cache"):
+    """Atomically save JSON cache."""
     try:
-        # 确保目录存在
-        cache_dir = os.path.dirname(CACHE_FILE_PATH)
-        if cache_dir and not os.path.exists(cache_dir):
-            os.makedirs(cache_dir, exist_ok=True)
-            logger.info(f"Created cache directory: {cache_dir}")
-
-        # 使用原子写入：先写临时文件，再重命名
-        temp_file = CACHE_FILE_PATH + ".tmp"
+        temp_file = filepath + ".tmp"
         with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(GLOBAL_NEWS_CACHE, f, ensure_ascii=False, indent=2)
-        os.replace(temp_file, CACHE_FILE_PATH)
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(temp_file, filepath)
+        logger.info(f"Saved {len(data)} items to {label}")
     except Exception as e:
-        logger.error(f"Failed to save news cache: {e}")
+        logger.error(f"Failed to save {label}: {e}")
 
 
-async def save_global_cache():
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, _save_cache_sync)
+def _compute_hash(data: str) -> str:
+    """Compute short hash for cache key."""
+    return hashlib.md5(data.encode("utf-8")).hexdigest()[:12]
+
+
+def load_all_caches():
+    """Load all cache files into memory."""
+    global GLOBAL_NEWS_CACHE, SENTIMENT_CACHE, TRADING_CACHE
+    _ensure_cache_dirs()
+
+    GLOBAL_NEWS_CACHE = _load_json_cache(NEWS_CACHE_FILE)
+    if GLOBAL_NEWS_CACHE:
+        logger.info(f"  [News Cache] Loaded {len(GLOBAL_NEWS_CACHE)} summaries")
+
+    SENTIMENT_CACHE = _load_json_cache(SENTIMENT_CACHE_FILE)
+    if SENTIMENT_CACHE:
+        logger.info(f"  [Sentiment Cache] Loaded {len(SENTIMENT_CACHE)} entries")
+
+    TRADING_CACHE = _load_json_cache(TRADING_CACHE_FILE)
+    if TRADING_CACHE:
+        logger.info(f"  [Trading Cache] Loaded {len(TRADING_CACHE)} entries")
+
+
+def save_all_caches():
+    """Save all caches to disk (called on exit)."""
+    _save_json_sync(GLOBAL_NEWS_CACHE, NEWS_CACHE_FILE, "news_summaries.json")
+    _save_json_sync(SENTIMENT_CACHE, SENTIMENT_CACHE_FILE, "sentiment_cache.json")
+    _save_json_sync(TRADING_CACHE, TRADING_CACHE_FILE, "trading_cache.json")
+
+
+def save_daily_snapshot(date: str, data: dict):
+    """Save per-day intermediate results to cache/daily/YYYY-MM-DD.json."""
+    _ensure_cache_dirs()
+    daily_file = os.path.join(DAILY_CACHE_DIR, f"{date}.json")
+    _save_json_sync(data, daily_file, f"daily/{date}.json")
+
+
+# Register atexit handler to save on process exit
+atexit.register(save_all_caches)
 
 
 class NewsProcessingAgent:
@@ -79,14 +133,16 @@ class NewsProcessingAgent:
         self.llm = ChatOpenAI(
             base_url=os.getenv("OPENAI_API_BASE"),
             api_key=os.getenv("OPENAI_API_KEY"),
-            model="EFundGPT-pro",  # default to light-model
+            model=os.getenv("MODEL_NAME", "qwen-plus"),
             temperature=0.1,
         )
-        load_global_cache()  # avoid duplicate requests to save tokens
+        # Cache is loaded once on first agent init
+        if not GLOBAL_NEWS_CACHE:
+            load_all_caches()
 
     async def extract_news_summary(self, news_item: Dict) -> Dict:
         """提取单条新闻摘要"""
-        global SAVE_COUNTER
+        global _news_save_counter
 
         # Generate cache key: THEDATE+TITLE+APP_TYPE+RANKING
         cache_key = f"{news_item.get('THEDATE', 'N/A')}_{news_item.get('TITLE', 'N/A')}_{news_item.get('APP_TYPE', 'N/A')}_{news_item.get('RANKING', 'N/A')}"
@@ -127,7 +183,7 @@ class NewsProcessingAgent:
 标题: {news_item.get("TITLE", "无标题")}
 来源: {news_item.get("APP_TYPE", "未知")}
 排名: {news_item.get("RANKING", "N/A")}
-内容: {news_item.get("CONTENT", "无内容")}
+内容: {news_item.get("CONTENT") or "无内容"}
 
 **要求**:
 1. 提取最核心的市场影响信息
@@ -177,7 +233,7 @@ class NewsProcessingAgent:
                 or not hasattr(response, "content")
                 or response.content is None
             ):
-                raise last_error or Exception(
+                raise last_error if last_error else Exception(
                     "Failed to generate summary after all retries"
                 )
 
@@ -197,11 +253,11 @@ class NewsProcessingAgent:
             if not future.done():
                 future.set_result(summary)
 
-            # Periodically save cache (e.g., every 1000 new items)
-            SAVE_COUNTER += 1
-            if SAVE_COUNTER % 1000 == 0:
-                # Fire and forget save to avoid waiting
-                asyncio.create_task(save_global_cache())
+            # Periodically save news cache (every 10 new items)
+            _news_save_counter += 1
+            if _news_save_counter >= NEWS_SAVE_INTERVAL:
+                _save_json_sync(GLOBAL_NEWS_CACHE, NEWS_CACHE_FILE, "news_summaries.json")
+                _news_save_counter = 0
 
             return self._format_result(news_item, summary)
 
@@ -227,7 +283,7 @@ class NewsProcessingAgent:
             "source": news_item.get("APP_TYPE", ""),
             "ranking": news_item.get("RANKING", 0),
             "summary": summary,
-            "original_content": news_item.get("CONTENT", "")[:100] + "...",
+            "original_content": (news_item.get("CONTENT") or "")[:100] + "...",
         }
 
     async def process_news_batch(
@@ -283,6 +339,20 @@ class SentimentAnalysisAgent:
                 "fund_analysis": {},
                 "summary": "无相关新闻信息",
             }
+
+        # Check sentiment cache (keyed by date + news batch + prompt structure)
+        news_hash = _compute_hash(json.dumps(
+            [(n.get("thedate"), n.get("title"), n.get("summary")) for n in processed_news],
+            ensure_ascii=False,
+        ))
+        # Include prompt structure hash so cache invalidates when analysis logic changes
+        prompt_signature = _compute_hash("sentiment_v1_" + json.dumps(
+            {"fund_pool": sorted(fund_pool)}, ensure_ascii=False, sort_keys=True
+        ))
+        sentiment_cache_key = f"{date_to_decision}_{news_hash}_{prompt_signature}"
+        if sentiment_cache_key in SENTIMENT_CACHE:
+            logger.debug(f"  - [Sentiment Cache Hit] {date_to_decision}")
+            return SENTIMENT_CACHE[sentiment_cache_key]
 
         # 构建基金列表文本
         funds_text = "\n".join(
@@ -343,6 +413,11 @@ class SentimentAnalysisAgent:
                     # process response
                     analysis = self.parser.parse(response.content)
                     logger.info(f"LLM analysis: {analysis}")
+
+                    # Save to sentiment cache
+                    SENTIMENT_CACHE[sentiment_cache_key] = analysis
+                    _save_json_sync(SENTIMENT_CACHE, SENTIMENT_CACHE_FILE, "sentiment_cache.json")
+
                     return analysis
                 except asyncio.TimeoutError:
                     logger.warning(f"LLM call timeout on attempt {i + 1}/{llm_retry}")
@@ -393,6 +468,20 @@ class TradingStrategyAgent:
         view_platform_trading_history_days: int = 3,
     ) -> Dict:
         """基于舆情和历史行情做出交易决策"""
+
+        # Check trading cache (keyed by date + portfolio state + strategy)
+        portfolio_key = json.dumps(
+            {"date": date_to_decision, "holdings": current_portfolio.get("holdings", {}),
+             "capital": current_portfolio.get("capital", 0),
+             "sentiment": sentiment_analysis.get("overall_sentiment", "neutral")},
+            ensure_ascii=False, sort_keys=True,
+        )
+        # CRITICAL: include prompt template hash so cache invalidates when strategy changes
+        strategy_hash = _compute_hash(self.prompt_template)
+        trading_cache_key = f"{date_to_decision}_{_compute_hash(portfolio_key)}_{strategy_hash}"
+        if trading_cache_key in TRADING_CACHE:
+            logger.debug(f"  - [Trading Cache Hit] {date_to_decision}")
+            return TRADING_CACHE[trading_cache_key]
 
         # 构建基金信息文本
         funds_text = "\n".join(
@@ -482,6 +571,11 @@ class TradingStrategyAgent:
                     response = await self.llm.ainvoke(prompt)
                     decision = self.parser.parse(response.content)
                     logger.info(f"LLM Agent decision: {decision}")
+
+                    # Save to trading cache
+                    TRADING_CACHE[trading_cache_key] = decision
+                    _save_json_sync(TRADING_CACHE, TRADING_CACHE_FILE, "trading_cache.json")
+
                     return decision
                 except Exception as e:
                     logger.exception(f"Parser failed on attempt {i + 1}/5: {e}")
@@ -582,6 +676,20 @@ class AdvancedTradingAgent:
                 )
             }
         )
+
+        # Save per-day snapshot for debugging and reuse
+        daily_snapshot = {
+            "date": date_to_decision,
+            "news_count": len(processed_news),
+            "news_processed": processed_news,
+            "sentiment_analysis": sentiment_analysis,
+            "trading_decision": trading_decision,
+            "portfolio_value": current_portfolio.get("total_value", 0),
+            "holdings": current_portfolio.get("holdings", {}),
+            "capital": current_portfolio.get("capital", 0),
+        }
+        save_daily_snapshot(date_to_decision, daily_snapshot)
+
         return {
             "final_decision": trading_decision,
             "intermediate_results": {

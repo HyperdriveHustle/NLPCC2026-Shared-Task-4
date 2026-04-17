@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
-from reporting.fund_arena import build_scenario_report, get_available_scenarios
+from ..reporting.fund_arena import build_scenario_report, get_available_scenarios
 
 router = APIRouter()
 
